@@ -3,7 +3,6 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPTransport } from "@hono/mcp";
 import { Hono } from "hono";
-import { cors } from "hono/cors";
 import { z } from "zod";
 import { createClient } from "@supabase/supabase-js";
 
@@ -69,102 +68,76 @@ Only extract what's explicitly there.`,
 }
 
 type ThoughtRow = {
-  id?: string;
   content: string;
   metadata: Record<string, unknown>;
   similarity?: number;
   created_at: string;
 };
 
-// --- Helper Functions for REST API ---
-
-async function listThoughts(params: {
-  limit?: number;
-  type?: string;
-  topic?: string;
-  person?: string;
-  days?: number;
-}): Promise<ThoughtRow[]> {
-  let q = supabase
-    .from("thoughts")
-    .select("id, content, metadata, created_at")
-    .order("created_at", { ascending: false })
-    .limit(params.limit || 50);
-
-  if (params.type) q = q.contains("metadata", { type: params.type });
-  if (params.topic) q = q.contains("metadata", { topics: [params.topic] });
-  if (params.person) q = q.contains("metadata", { people: [params.person] });
-  if (params.days) {
-    const since = new Date();
-    since.setDate(since.getDate() - params.days);
-    q = q.gte("created_at", since.toISOString());
-  }
-
-  const { data, error } = await q;
-  if (error) throw new Error(error.message);
-  return (data || []) as ThoughtRow[];
+function normalizeQuery(q: string): string {
+  return q.trim().toLowerCase();
 }
 
-async function searchThoughts(query: string, limit: number, threshold: number): Promise<ThoughtRow[]> {
-  const embedding = await getEmbedding(query);
+function buildQueryVariants(q: string): string[] {
+  const original = q.trim();
+  const base = normalizeQuery(q);
+  const variants = new Set<string>([original]);
+
+  const relationshipAliases = [
+    "wife",
+    "spouse",
+    "partner",
+    "girlfriend",
+    "cohabitant",
+    "husband",
+    "kone",
+    "ektefelle",
+    "samboer",
+    "kjareste",
+    "kj\u00e6reste",
+    "mann",
+  ];
+
+  const hasRelationshipTerm = relationshipAliases.some((term) => base.includes(term));
+
+  if (hasRelationshipTerm) {
+    for (const term of relationshipAliases) {
+      variants.add(term);
+      variants.add(`${original} ${term}`.trim());
+    }
+  } else {
+    variants.add(`${original} wife`.trim());
+    variants.add(`${original} spouse`.trim());
+    variants.add(`${original} kone`.trim());
+    variants.add(`${original} samboer`.trim());
+  }
+
+  return Array.from(variants).slice(0, 8);
+}
+
+async function runSemanticSearch(query: string, limit: number, threshold: number): Promise<ThoughtRow[]> {
+  const qEmb = await getEmbedding(query);
   const { data, error } = await supabase.rpc("match_thoughts", {
-    query_embedding: embedding,
+    query_embedding: qEmb,
     match_threshold: threshold,
     match_count: limit,
     filter: {},
   });
+
   if (error) throw new Error(error.message);
   return (data || []) as ThoughtRow[];
 }
 
-async function getStats(): Promise<{
-  total: number;
-  types: Record<string, number>;
-  topics: Record<string, number>;
-  people: Record<string, number>;
-}> {
-  const { count } = await supabase
-    .from("thoughts")
-    .select("*", { count: "exact", head: true });
-
-  const { data } = await supabase
-    .from("thoughts")
-    .select("metadata");
-
-  const types: Record<string, number> = {};
-  const topics: Record<string, number> = {};
-  const people: Record<string, number> = {};
-
-  for (const r of data || []) {
-    const m = (r.metadata || {}) as Record<string, unknown>;
-    if (m.type) types[m.type as string] = (types[m.type as string] || 0) + 1;
-    if (Array.isArray(m.topics))
-      for (const t of m.topics) topics[t as string] = (topics[t as string] || 0) + 1;
-    if (Array.isArray(m.people))
-      for (const p of m.people) people[p as string] = (people[p as string] || 0) + 1;
-  }
-
-  return { total: count || 0, types, topics, people };
-}
-
-async function captureThought(content: string): Promise<ThoughtRow> {
-  const [embedding, metadata] = await Promise.all([
-    getEmbedding(content),
-    extractMetadata(content),
-  ]);
-
+async function runLexicalFallback(query: string, limit: number): Promise<ThoughtRow[]> {
   const { data, error } = await supabase
     .from("thoughts")
-    .insert({
-      content,
-      embedding,
-      metadata: { ...metadata, source: "web" },
-    })
-    .select()
-    .single();
+    .select("content, metadata, created_at")
+    .ilike("content", `%${query}%`)
+    .order("created_at", { ascending: false })
+    .limit(limit);
 
   if (error) throw new Error(error.message);
-  return data as ThoughtRow;
+  return (data || []) as ThoughtRow[];
 }
 
 // --- MCP Server Setup ---
@@ -174,8 +147,7 @@ const server = new McpServer({
   version: "1.0.0",
 });
 
-// MCP Tools (keeping existing implementations)
-
+// Tool 1: Semantic Search
 server.registerTool(
   "search_thoughts",
   {
@@ -190,20 +162,123 @@ server.registerTool(
   },
   async ({ query, limit, threshold }: { query: string; limit: number; threshold: number }) => {
     try {
-      const results = await searchThoughts(query, limit || 10, threshold || 0.5);
-      if (results.length === 0) {
+      const safeLimit = Math.max(1, limit ?? 10);
+      const primaryThreshold = threshold ?? 0.5;
+      const lowerThreshold = Math.min(primaryThreshold, 0.35);
+
+      const queriesTried: string[] = [];
+      const thresholdsTried: number[] = [];
+      const collected: ThoughtRow[] = [];
+      const seen = new Set<string>();
+
+      const addRows = (rows: ThoughtRow[]) => {
+        for (const r of rows) {
+          const key = `${r.content}::${r.created_at}`;
+          if (!seen.has(key)) {
+            seen.add(key);
+            collected.push(r);
+          }
+        }
+      };
+
+      queriesTried.push(query);
+      thresholdsTried.push(primaryThreshold);
+      addRows(await runSemanticSearch(query, safeLimit, primaryThreshold));
+
+      const variants = buildQueryVariants(query).filter((v) => v !== query);
+
+      if (collected.length === 0) {
+        for (const v of variants) {
+          queriesTried.push(v);
+          thresholdsTried.push(primaryThreshold);
+          addRows(await runSemanticSearch(v, safeLimit, primaryThreshold));
+          if (collected.length >= safeLimit) break;
+        }
+      }
+
+      if (collected.length === 0 && lowerThreshold < primaryThreshold) {
+        queriesTried.push(query);
+        thresholdsTried.push(lowerThreshold);
+        addRows(await runSemanticSearch(query, safeLimit, lowerThreshold));
+
+        if (collected.length === 0) {
+          for (const v of variants) {
+            queriesTried.push(v);
+            thresholdsTried.push(lowerThreshold);
+            addRows(await runSemanticSearch(v, safeLimit, lowerThreshold));
+            if (collected.length >= safeLimit) break;
+          }
+        }
+      }
+
+      let strategyUsed = "semantic";
+      if (collected.length === 0) {
+        strategyUsed = "lexical_fallback";
+        addRows(await runLexicalFallback(query, safeLimit));
+      }
+
+      if (collected.length === 0) {
         return {
-          content: [{ type: "text" as const, text: `No thoughts found matching "${query}".` }],
+          content: [
+            {
+              type: "text" as const,
+              text:
+                `No thoughts found matching "${query}" after semantic+lexical fallback.\n` +
+                `Search strategy: ${strategyUsed}\n` +
+                `Queries tried: ${queriesTried.join(" | ")}\n` +
+                `Thresholds tried: ${Array.from(new Set(thresholdsTried)).join(", ")}\n` +
+                "Best score: n/a",
+            },
+          ],
         };
       }
-      const text = results
-        .map((t, i) => {
+
+      collected.sort((a, b) => {
+        const sa = typeof a.similarity === "number" ? a.similarity : -1;
+        const sb = typeof b.similarity === "number" ? b.similarity : -1;
+        if (sa !== sb) return sb - sa;
+        return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
+      });
+
+      const top = collected.slice(0, safeLimit);
+
+      const results = top.map((t: ThoughtRow, i: number) => {
           const m = t.metadata || {};
-          const sim = typeof t.similarity === "number" ? ` (${(t.similarity * 100).toFixed(1)}% match)` : "";
-          return `--- Result ${i + 1}${sim} ---\nCaptured: ${new Date(t.created_at).toLocaleDateString()}\nType: ${m.type || "unknown"}\nTopics: ${(m.topics as string[] || []).join(", ")}\n\n${t.content}`;
-        })
-        .join("\n\n");
-      return { content: [{ type: "text" as const, text: `Found ${results.length} thought(s):\n\n${text}` }] };
+          const similarityLabel =
+            typeof t.similarity === "number"
+              ? ` (${(t.similarity * 100).toFixed(1)}% match)`
+              : " (lexical)";
+
+          const parts = [
+            `--- Result ${i + 1}${similarityLabel} ---`,
+            `Captured: ${new Date(t.created_at).toLocaleDateString()}`,
+            `Type: ${m.type || "unknown"}`,
+          ];
+          if (Array.isArray(m.topics) && m.topics.length)
+            parts.push(`Topics: ${(m.topics as string[]).join(", ")}`);
+          if (Array.isArray(m.people) && m.people.length)
+            parts.push(`People: ${(m.people as string[]).join(", ")}`);
+          if (Array.isArray(m.action_items) && m.action_items.length)
+            parts.push(`Actions: ${(m.action_items as string[]).join("; ")}`);
+          parts.push(`\n${t.content}`);
+          return parts.join("\n");
+        });
+
+      const bestScore = top.find((r) => typeof r.similarity === "number")?.similarity;
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text:
+              `Found ${top.length} thought(s):\n\n${results.join("\n\n")}\n\n` +
+              `Search strategy: ${strategyUsed}\n` +
+              `Queries tried: ${queriesTried.join(" | ")}\n` +
+              `Thresholds tried: ${Array.from(new Set(thresholdsTried)).join(", ")}\n` +
+              `Best score: ${typeof bestScore === "number" ? bestScore.toFixed(3) : "n/a"}`,
+          },
+        ],
+      };
     } catch (err: unknown) {
       return {
         content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }],
@@ -213,6 +288,7 @@ server.registerTool(
   }
 );
 
+// Tool 2: List Recent
 server.registerTool(
   "list_thoughts",
   {
@@ -227,19 +303,67 @@ server.registerTool(
       days: z.number().optional().describe("Only thoughts from the last N days"),
     },
   },
-  async (params: { limit?: number; type?: string; topic?: string; person?: string; days?: number }) => {
+  async ({
+    limit,
+    type,
+    topic,
+    person,
+    days,
+  }: {
+    limit: number;
+    type?: string;
+    topic?: string;
+    person?: string;
+    days?: number;
+  }) => {
     try {
-      const results = await listThoughts(params);
-      if (results.length === 0) {
+      let q = supabase
+        .from("thoughts")
+        .select("content, metadata, created_at")
+        .order("created_at", { ascending: false })
+        .limit(limit);
+
+      if (type) q = q.contains("metadata", { type });
+      if (topic) q = q.contains("metadata", { topics: [topic] });
+      if (person) q = q.contains("metadata", { people: [person] });
+      if (days) {
+        const since = new Date();
+        since.setDate(since.getDate() - days);
+        q = q.gte("created_at", since.toISOString());
+      }
+
+      const { data, error } = await q;
+
+      if (error) {
+        return {
+          content: [{ type: "text" as const, text: `Error: ${error.message}` }],
+          isError: true,
+        };
+      }
+
+      if (!data || !data.length) {
         return { content: [{ type: "text" as const, text: "No thoughts found." }] };
       }
-      const text = results
-        .map((t, i) => {
+
+      const results = data.map(
+        (
+          t: { content: string; metadata: Record<string, unknown>; created_at: string },
+          i: number
+        ) => {
           const m = t.metadata || {};
-          return `${i + 1}. [${new Date(t.created_at).toLocaleDateString()}] (${m.type || "??"})\n   ${t.content}`;
-        })
-        .join("\n\n");
-      return { content: [{ type: "text" as const, text: `${results.length} recent thought(s):\n\n${text}` }] };
+          const tags = Array.isArray(m.topics) ? (m.topics as string[]).join(", ") : "";
+          return `${i + 1}. [${new Date(t.created_at).toLocaleDateString()}] (${m.type || "??"}${tags ? " - " + tags : ""})\n   ${t.content}`;
+        }
+      );
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `${data.length} recent thought(s):\n\n${results.join("\n\n")}`,
+          },
+        ],
+      };
     } catch (err: unknown) {
       return {
         content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }],
@@ -249,6 +373,7 @@ server.registerTool(
   }
 );
 
+// Tool 3: Stats
 server.registerTool(
   "thought_stats",
   {
@@ -258,21 +383,57 @@ server.registerTool(
   },
   async () => {
     try {
-      const stats = await getStats();
-      const lines = [
-        `Total thoughts: ${stats.total}`,
+      const { count } = await supabase
+        .from("thoughts")
+        .select("*", { count: "exact", head: true });
+
+      const { data } = await supabase
+        .from("thoughts")
+        .select("metadata, created_at")
+        .order("created_at", { ascending: false });
+
+      const types: Record<string, number> = {};
+      const topics: Record<string, number> = {};
+      const people: Record<string, number> = {};
+
+      for (const r of data || []) {
+        const m = (r.metadata || {}) as Record<string, unknown>;
+        if (m.type) types[m.type as string] = (types[m.type as string] || 0) + 1;
+        if (Array.isArray(m.topics))
+          for (const t of m.topics) topics[t as string] = (topics[t as string] || 0) + 1;
+        if (Array.isArray(m.people))
+          for (const p of m.people) people[p as string] = (people[p as string] || 0) + 1;
+      }
+
+      const sort = (o: Record<string, number>): [string, number][] =>
+        Object.entries(o)
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 10);
+
+      const lines: string[] = [
+        `Total thoughts: ${count}`,
+        `Date range: ${
+          data?.length
+            ? new Date(data[data.length - 1].created_at).toLocaleDateString() +
+              " → " +
+              new Date(data[0].created_at).toLocaleDateString()
+            : "N/A"
+        }`,
         "",
         "Types:",
-        ...Object.entries(stats.types).map(([k, v]) => `  ${k}: ${v}`),
+        ...sort(types).map(([k, v]) => `  ${k}: ${v}`),
       ];
-      if (Object.keys(stats.topics).length) {
+
+      if (Object.keys(topics).length) {
         lines.push("", "Top topics:");
-        lines.push(...Object.entries(stats.topics).slice(0, 10).map(([k, v]) => `  ${k}: ${v}`));
+        for (const [k, v] of sort(topics)) lines.push(`  ${k}: ${v}`);
       }
-      if (Object.keys(stats.people).length) {
+
+      if (Object.keys(people).length) {
         lines.push("", "People mentioned:");
-        lines.push(...Object.entries(stats.people).map(([k, v]) => `  ${k}: ${v}`));
+        for (const [k, v] of sort(people)) lines.push(`  ${k}: ${v}`);
       }
+
       return { content: [{ type: "text" as const, text: lines.join("\n") }] };
     } catch (err: unknown) {
       return {
@@ -283,24 +444,49 @@ server.registerTool(
   }
 );
 
+// Tool 4: Capture Thought
 server.registerTool(
   "capture_thought",
   {
     title: "Capture Thought",
     description:
-      "Save a new thought to the Open Brain. Generates an embedding and extracts metadata automatically.",
+      "Save a new thought to the Open Brain. Generates an embedding and extracts metadata automatically. Use this when the user wants to save something to their brain directly from any AI client — notes, insights, decisions, or migrated content from other systems.",
     inputSchema: {
-      content: z.string().describe("The thought to capture"),
+      content: z.string().describe("The thought to capture — a clear, standalone statement that will make sense when retrieved later by any AI"),
     },
   },
   async ({ content }: { content: string }) => {
     try {
-      const result = await captureThought(content);
-      const meta = result.metadata as Record<string, unknown>;
+      const [embedding, metadata] = await Promise.all([
+        getEmbedding(content),
+        extractMetadata(content),
+      ]);
+
+      const { error } = await supabase.from("thoughts").insert({
+        content,
+        embedding,
+        metadata: { ...metadata, source: "mcp" },
+      });
+
+      if (error) {
+        return {
+          content: [{ type: "text" as const, text: `Failed to capture: ${error.message}` }],
+          isError: true,
+        };
+      }
+
+      const meta = metadata as Record<string, unknown>;
       let confirmation = `Captured as ${meta.type || "thought"}`;
       if (Array.isArray(meta.topics) && meta.topics.length)
         confirmation += ` — ${(meta.topics as string[]).join(", ")}`;
-      return { content: [{ type: "text" as const, text: confirmation }] };
+      if (Array.isArray(meta.people) && meta.people.length)
+        confirmation += ` | People: ${(meta.people as string[]).join(", ")}`;
+      if (Array.isArray(meta.action_items) && meta.action_items.length)
+        confirmation += ` | Actions: ${(meta.action_items as string[]).join("; ")}`;
+
+      return {
+        content: [{ type: "text" as const, text: confirmation }],
+      };
     } catch (err: unknown) {
       return {
         content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }],
@@ -310,85 +496,12 @@ server.registerTool(
   }
 );
 
-// --- Hono App with REST API + MCP ---
+// --- Hono App with Auth Check ---
 
 const app = new Hono();
 
-// CORS for web app
-app.use(
-  "/api/*",
-  cors({
-    origin: "*",
-    allowMethods: ["GET", "POST", "OPTIONS"],
-    allowHeaders: ["Content-Type", "x-brain-key"],
-  })
-);
-
-// Auth middleware for REST API
-const checkAuth = (c: any): boolean => {
-  const provided = c.req.header("x-brain-key") || c.req.query("key");
-  return provided && provided === MCP_ACCESS_KEY;
-};
-
-// REST API: Get stats
-app.get("/api/stats", async (c: any) => {
-  if (!checkAuth(c)) return c.json({ error: "Unauthorized" }, 401);
-  try {
-    const stats = await getStats();
-    return c.json(stats);
-  } catch (err) {
-    return c.json({ error: (err as Error).message }, 500);
-  }
-});
-
-// REST API: List thoughts
-app.get("/api/thoughts", async (c: any) => {
-  if (!checkAuth(c)) return c.json({ error: "Unauthorized" }, 401);
-  try {
-    const params = {
-      limit: parseInt(c.req.query("limit") || "50"),
-      type: c.req.query("type") || undefined,
-      topic: c.req.query("topic") || undefined,
-      person: c.req.query("person") || undefined,
-      days: c.req.query("days") ? parseInt(c.req.query("days")) : undefined,
-    };
-    const thoughts = await listThoughts(params);
-    return c.json(thoughts);
-  } catch (err) {
-    return c.json({ error: (err as Error).message }, 500);
-  }
-});
-
-// REST API: Search thoughts
-app.get("/api/search", async (c: any) => {
-  if (!checkAuth(c)) return c.json({ error: "Unauthorized" }, 401);
-  try {
-    const query = c.req.query("q");
-    if (!query) return c.json({ error: "Missing query parameter 'q'" }, 400);
-    const limit = parseInt(c.req.query("limit") || "10");
-    const threshold = parseFloat(c.req.query("threshold") || "0.5");
-    const results = await searchThoughts(query, limit, threshold);
-    return c.json(results);
-  } catch (err) {
-    return c.json({ error: (err as Error).message }, 500);
-  }
-});
-
-// REST API: Capture thought
-app.post("/api/thoughts", async (c: any) => {
-  if (!checkAuth(c)) return c.json({ error: "Unauthorized" }, 401);
-  try {
-    const body = await c.req.json();
-    if (!body.content) return c.json({ error: "Missing 'content' field" }, 400);
-    const result = await captureThought(body.content);
-    return c.json(result, 201);
-  } catch (err) {
-    return c.json({ error: (err as Error).message }, 500);
-  }
-});
-
-// MCP endpoint (catches all other requests)
 app.all("*", async (c: any) => {
+  // Accept access key via header OR URL query parameter
   const provided = c.req.header("x-brain-key") || new URL(c.req.url).searchParams.get("key");
   if (!provided || provided !== MCP_ACCESS_KEY) {
     return c.json({ error: "Invalid or missing access key" }, 401);

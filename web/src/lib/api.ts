@@ -22,7 +22,7 @@ interface Stats {
 }
 
 async function fetchApi<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
-	const url = `${PUBLIC_MCP_URL}${endpoint}`;
+	const url = `${PUBLIC_MCP_URL}/api${endpoint}`;
 	const res = await fetch(url, {
 		...options,
 		headers: {
