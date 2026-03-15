@@ -3,6 +3,7 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPTransport } from "@hono/mcp";
 import { Hono } from "hono";
+import { cors } from "hono/cors";
 import { z } from "zod";
 import { createClient } from "@supabase/supabase-js";
 
@@ -499,6 +500,13 @@ server.registerTool(
 // --- Hono App with Auth Check ---
 
 const app = new Hono();
+
+// CORS for browser clients (web app)
+app.use("*", cors({
+  origin: "*",
+  allowMethods: ["GET", "POST", "OPTIONS"],
+  allowHeaders: ["Content-Type", "x-brain-key"],
+}));
 
 app.all("*", async (c: any) => {
   // Accept access key via header OR URL query parameter
