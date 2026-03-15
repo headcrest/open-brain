@@ -5,6 +5,8 @@
 
 	let thoughts = $state<Thought[]>([]);
 	let loading = $state(true);
+	let searching = $state(false);
+	let hasSearched = $state(false);
 	let searchQuery = $state('');
 	let selectedType = $state<ThoughtType | null>(null);
 	let selectedTopic = $state<string | null>(null);
@@ -15,25 +17,89 @@
 	let showCapture = $state(false);
 	let captureContent = $state('');
 	let capturing = $state(false);
+	let selectedThought = $state<Thought | null>(null);
+	let latestResultKey = $state<string | null>(null);
+	let searchInput: HTMLInputElement | null = null;
 
-	let searchTimeout: ReturnType<typeof setTimeout>;
+	const typeButtonClass: Record<ThoughtType, string> = {
+		observation: 'bg-observation text-white',
+		task: 'bg-task text-white',
+		idea: 'bg-idea text-white',
+		reference: 'bg-reference text-white',
+		person_note: 'bg-person-note text-white'
+	};
+
+	const typeDotClass: Record<ThoughtType, string> = {
+		observation: 'bg-observation',
+		task: 'bg-task',
+		idea: 'bg-idea',
+		reference: 'bg-reference',
+		person_note: 'bg-person-note'
+	};
+
+	const typeBadgeClass: Record<ThoughtType, string> = {
+		observation: 'bg-observation/20 text-observation',
+		task: 'bg-task/20 text-task',
+		idea: 'bg-idea/20 text-idea',
+		reference: 'bg-reference/20 text-reference',
+		person_note: 'bg-person-note/20 text-person-note'
+	};
+
+	function safeType(type?: ThoughtType): ThoughtType {
+		return type ?? 'observation';
+	}
+
+	function thoughtKey(thought: Thought): string {
+		return `${thought.created_at}::${thought.content}`;
+	}
 
 	onMount(async () => {
-		await Promise.all([loadThoughts(), loadStats()]);
+		searchInput?.focus();
+		await loadStats();
 		loading = false;
 	});
 
 	async function loadThoughts() {
+		const query = searchQuery.trim();
+		if (!query) {
+			return;
+		}
+
+		searching = true;
 		try {
-			thoughts = await getThoughts({
-				type: selectedType,
-				topic: selectedTopic,
-				person: selectedPerson,
-				search: searchQuery.trim() || undefined,
+			const fetchedThoughts = await getThoughts({
+				search: query,
 			});
+			const sortedFetchedThoughts = fetchedThoughts.sort(
+				(a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+			);
+
+			latestResultKey = sortedFetchedThoughts.length ? thoughtKey(sortedFetchedThoughts[0]) : null;
+
+			const seen = new Set<string>();
+			const merged: Thought[] = [];
+
+			for (const t of sortedFetchedThoughts) {
+				const key = thoughtKey(t);
+				if (seen.has(key)) continue;
+				seen.add(key);
+				merged.push(t);
+			}
+
+			for (const t of thoughts) {
+				const key = thoughtKey(t);
+				if (seen.has(key)) continue;
+				seen.add(key);
+				merged.push(t);
+			}
+
+			thoughts = merged;
+			hasSearched = true;
 			extractFilters();
 		} catch (err) {
 			console.error('Failed to load thoughts:', err);
+		} finally {
+			searching = false;
 		}
 	}
 
@@ -59,34 +125,64 @@
 		allPeople = Array.from(people).sort();
 	}
 
-	function handleSearch() {
-		clearTimeout(searchTimeout);
-		searchTimeout = setTimeout(() => {
-			loadThoughts();
-		}, 300);
+	function handleSearchInput() {
+		// Keep existing results when query is cleared.
+	}
+
+	function handleSearchKeydown(event: KeyboardEvent) {
+		if (event.key !== 'Enter' && event.code !== 'NumpadEnter') return;
+		event.preventDefault();
+		loadThoughts();
+	}
+
+	function submitSearch(event: SubmitEvent) {
+		event.preventDefault();
+		loadThoughts();
+	}
+
+	function clearSearchQuery() {
+		searchQuery = '';
+		searchInput?.focus();
+	}
+
+	function clearResults() {
+		hasSearched = false;
+		thoughts = [];
+		latestResultKey = null;
+		selectedType = null;
+		selectedTopic = null;
+		selectedPerson = null;
 	}
 
 	function filterByType(type: ThoughtType | null) {
 		selectedType = type;
-		loadThoughts();
 	}
 
 	function filterByTopic(topic: string | null) {
 		selectedTopic = topic;
-		loadThoughts();
 	}
 
 	function filterByPerson(person: string | null) {
 		selectedPerson = person;
-		loadThoughts();
 	}
 
 	function clearFilters() {
 		selectedType = null;
 		selectedTopic = null;
 		selectedPerson = null;
-		searchQuery = '';
-		loadThoughts();
+	}
+
+	function getVisibleThoughts(): Thought[] {
+		return thoughts.filter((t) => {
+			if (selectedType && t.metadata.type !== selectedType) return false;
+			if (selectedTopic && !(t.metadata.topics || []).includes(selectedTopic)) return false;
+			if (selectedPerson && !(t.metadata.people || []).includes(selectedPerson)) return false;
+			return true;
+		});
+	}
+
+	function getTypeCountInResults(type: ThoughtType): number {
+		return thoughts.filter((t) => t.metadata.type === type).length;
 	}
 
 	function formatDate(date: string): string {
@@ -97,6 +193,20 @@
 		});
 	}
 
+	function openThought(thought: Thought) {
+		selectedThought = thought;
+	}
+
+	function closeThoughtModal() {
+		selectedThought = null;
+	}
+
+	function handleCardKeydown(event: KeyboardEvent, thought: Thought) {
+		if (event.key !== 'Enter' && event.key !== ' ') return;
+		event.preventDefault();
+		openThought(thought);
+	}
+
 	async function handleCapture() {
 		if (!captureContent.trim()) return;
 		capturing = true;
@@ -104,7 +214,8 @@
 			await captureThought(captureContent);
 			captureContent = '';
 			showCapture = false;
-			await Promise.all([loadThoughts(), loadStats()]);
+			await loadStats();
+			if (hasSearched) await loadThoughts();
 		} catch (err) {
 			console.error('Failed to capture:', err);
 		}
@@ -128,7 +239,7 @@
 			onclick={() => showCapture = !showCapture}
 			class="px-4 py-2 bg-primary hover:bg-primary-light text-white rounded-lg font-medium transition-colors"
 		>
-			+ Capture
+			{showCapture ? 'Close' : '+ Capture'}
 		</button>
 	</div>
 
@@ -161,18 +272,55 @@
 
 	<!-- Search -->
 	<div class="mb-6">
-		<div class="relative">
+		<form class="relative" onsubmit={submitSearch}>
 			<input
+				bind:this={searchInput}
 				type="text"
 				bind:value={searchQuery}
-				oninput={handleSearch}
+				oninput={handleSearchInput}
+				onkeydown={handleSearchKeydown}
 				placeholder="Search thoughts..."
-				class="w-full bg-bg-elevated border border-white/10 rounded-xl px-5 py-3.5 pl-12 text-text placeholder:text-text-muted focus:outline-none focus:border-primary transition-colors"
+				class="w-full bg-bg-elevated border border-white/10 rounded-xl px-5 py-3.5 pl-12 pr-56 text-text placeholder:text-text-muted focus:outline-none focus:border-primary transition-colors"
 			/>
 			<svg class="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-text-muted" fill="none" stroke="currentColor" viewBox="0 0 24 24">
 				<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
 			</svg>
-		</div>
+			<div class="absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-2">
+				{#if searchQuery.trim()}
+				<button
+					type="button"
+					onclick={clearSearchQuery}
+					aria-label="Clear search"
+					class="w-8 h-8 inline-flex items-center justify-center bg-white/5 hover:bg-white/10 text-text-muted hover:text-text rounded-full text-sm font-medium transition-colors"
+				>
+					<svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+						<path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" />
+					</svg>
+				</button>
+				{/if}
+				<button
+					type="submit"
+					disabled={searching}
+					class="w-28 px-4 py-1.5 bg-primary hover:bg-primary-light disabled:opacity-70 text-white rounded-lg text-sm font-medium transition-colors text-center"
+				>
+					{searching ? 'Searching...' : 'Search'}
+				</button>
+			</div>
+		</form>
+		{#if searching}
+			<div class="mt-2 text-sm text-text-muted">Searching thoughts...</div>
+		{/if}
+		{#if hasSearched && !searching}
+			<div class="mt-2">
+				<button
+					type="button"
+					onclick={clearResults}
+					class="text-sm text-text-muted hover:text-text transition-colors"
+				>
+					Clear results
+				</button>
+			</div>
+		{/if}
 	</div>
 
 	<!-- Type Filters -->
@@ -187,12 +335,12 @@
 			{#each THOUGHT_TYPES as type}
 				<button
 					onclick={() => filterByType(type.value)}
-					class="px-4 py-2 rounded-full text-sm font-medium transition-all flex items-center gap-2 {selectedType === type.value ? `bg-${type.color} text-white` : 'bg-bg-elevated text-text-muted hover:text-text'}"
+					class="px-4 py-2 rounded-full text-sm font-medium transition-all flex items-center gap-2 {selectedType === type.value ? typeButtonClass[type.value] : 'bg-bg-elevated text-text-muted hover:text-text'}"
 				>
-					<span class="w-2 h-2 rounded-full bg-{type.color}"></span>
+					<span class="w-2 h-2 rounded-full {typeDotClass[type.value]}"></span>
 					{type.label}
-					{#if stats.types[type.value]}
-						<span class="opacity-60">({stats.types[type.value]})</span>
+					{#if hasSearched && getTypeCountInResults(type.value) > 0}
+						<span class="opacity-60">({getTypeCountInResults(type.value)})</span>
 					{/if}
 				</button>
 			{/each}
@@ -232,7 +380,16 @@
 		<div class="flex items-center justify-center py-20">
 			<div class="text-text-muted">Loading thoughts...</div>
 		</div>
-	{:else if thoughts.length === 0}
+	{:else if searching && !hasSearched}
+		<div class="flex items-center justify-center py-20">
+			<div class="text-text-muted">Searching...</div>
+		</div>
+	{:else if !hasSearched}
+		<div class="text-center py-20">
+			<div class="text-4xl mb-4">🔎</div>
+			<div class="text-text-muted">Search to explore your thoughts</div>
+		</div>
+	{:else if getVisibleThoughts().length === 0}
 		<div class="text-center py-20">
 			<div class="text-4xl mb-4">🧠</div>
 			<div class="text-text-muted">No thoughts found</div>
@@ -244,12 +401,20 @@
 		</div>
 	{:else}
 		<!-- Thoughts Grid -->
-		<div class="grid gap-4">
-			{#each thoughts as thought}
-				<article class="bg-bg-card border border-white/5 rounded-xl p-5 hover:border-white/10 transition-colors">
+		<div class="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+			{#each getVisibleThoughts() as thought}
+				{@const thoughtType = safeType(thought.metadata.type)}
+				{@const isLatestResult = latestResultKey === thoughtKey(thought)}
+				<div
+					tabindex="0"
+					role="button"
+					onclick={() => openThought(thought)}
+					onkeydown={(event) => handleCardKeydown(event, thought)}
+					class="h-full bg-bg-card border rounded-xl p-5 transition-colors cursor-pointer focus:outline-none focus:border-primary {isLatestResult ? 'border-primary/50 ring-2 ring-primary/30 animate-pulse shadow-[0_0_24px_rgba(99,102,241,0.35)]' : 'border-white/5 hover:border-white/10'}"
+				>
 					<div class="flex items-start justify-between gap-4 mb-3">
-						<span class="inline-flex items-center gap-2 px-2.5 py-1 rounded-full text-xs font-medium bg-{thought.metadata.type || 'observation'}/20 text-{thought.metadata.type || 'observation'}">
-							<span class="w-1.5 h-1.5 rounded-full bg-{thought.metadata.type || 'observation'}"></span>
+						<span class="inline-flex items-center gap-2 px-2.5 py-1 rounded-full text-xs font-medium {typeBadgeClass[thoughtType]}">
+							<span class="w-1.5 h-1.5 rounded-full {typeDotClass[thoughtType]}"></span>
 							{THOUGHT_TYPES.find(t => t.value === thought.metadata.type)?.label || 'Thought'}
 						</span>
 						<time class="text-text-muted text-xs">{formatDate(thought.created_at)}</time>
@@ -261,7 +426,10 @@
 						<div class="mt-4 flex flex-wrap gap-2">
 							{#each thought.metadata.topics || [] as topic}
 								<button
-									onclick={() => filterByTopic(topic)}
+									onclick={(event) => {
+										event.stopPropagation();
+										filterByTopic(topic);
+									}}
 									class="px-2 py-0.5 bg-white/5 hover:bg-accent/20 hover:text-accent rounded text-xs text-text-muted transition-colors"
 								>
 									#{topic}
@@ -269,7 +437,10 @@
 							{/each}
 							{#each thought.metadata.people || [] as person}
 								<button
-									onclick={() => filterByPerson(person)}
+									onclick={(event) => {
+										event.stopPropagation();
+										filterByPerson(person);
+									}}
 									class="px-2 py-0.5 bg-white/5 hover:bg-person-note/20 hover:text-person-note rounded text-xs text-text-muted transition-colors"
 								>
 									@{person}
@@ -291,8 +462,46 @@
 							</ul>
 						</div>
 					{/if}
-				</article>
+				</div>
 			{/each}
 		</div>
 	{/if}
 </div>
+
+{#if selectedThought}
+	{@const activeThought = selectedThought}
+	<div class="fixed inset-0 z-50 p-4 flex items-center justify-center">
+		<button
+			type="button"
+			class="absolute inset-0 bg-black/70 backdrop-blur-sm"
+			onclick={closeThoughtModal}
+			aria-label="Close thought modal"
+		></button>
+		<div class="relative w-full max-w-2xl bg-bg-card border border-white/10 rounded-2xl overflow-hidden">
+			<div class="flex items-start justify-between gap-3 p-5 border-b border-white/10">
+				<div>
+					<div class="text-xs text-text-muted mb-1">{formatDate(activeThought.created_at)}</div>
+					<div class="text-sm font-medium text-text">
+						{THOUGHT_TYPES.find((t) => t.value === activeThought.metadata.type)?.label || 'Thought'}
+					</div>
+				</div>
+				<button
+					type="button"
+					onclick={closeThoughtModal}
+					class="w-8 h-8 inline-flex items-center justify-center rounded-full bg-white/5 hover:bg-white/10 text-text-muted hover:text-text transition-colors"
+					aria-label="Close thought modal"
+				>
+					<svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+						<path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" />
+					</svg>
+				</button>
+			</div>
+
+			<div class="p-5">
+				<div class="max-h-[65vh] overflow-y-auto pr-1 text-text leading-relaxed whitespace-pre-wrap">
+					{activeThought.content}
+				</div>
+			</div>
+		</div>
+	</div>
+{/if}

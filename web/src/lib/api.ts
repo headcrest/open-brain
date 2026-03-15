@@ -1,8 +1,12 @@
-import { PUBLIC_MCP_URL, PUBLIC_MCP_KEY } from '$env/static/public';
 import type { Thought, ThoughtType } from './types';
 
 interface McpToolResult {
 	content: { type: string; text: string }[];
+}
+
+interface McpJsonRpcResponse {
+	result?: McpToolResult;
+	error?: { message?: string };
 }
 
 interface ApiThought {
@@ -17,37 +21,33 @@ interface ApiThought {
 	created_at: string;
 }
 
-let requestId = 0;
-
 async function callMcpTool(name: string, args: Record<string, unknown> = {}): Promise<McpToolResult> {
-	const url = `${PUBLIC_MCP_URL}?key=${PUBLIC_MCP_KEY}`;
-	
-	const response = await fetch(url, {
+	const response = await fetch('/api/mcp', {
 		method: 'POST',
 		headers: {
-			'Content-Type': 'application/json',
+			'Content-Type': 'application/json'
 		},
 		body: JSON.stringify({
-			jsonrpc: '2.0',
-			id: ++requestId,
-			method: 'tools/call',
-			params: {
-				name,
-				arguments: args
-			}
+			name,
+			args
 		})
 	});
 	
 	if (!response.ok) {
-		throw new Error(`HTTP ${response.status}`);
+		const body = (await response.json().catch(() => ({}))) as { error?: string };
+		throw new Error(body.error || `HTTP ${response.status}`);
 	}
-	
-	const result = await response.json();
+
+	const result = (await response.json()) as McpJsonRpcResponse;
 	
 	if (result.error) {
 		throw new Error(result.error.message || 'MCP error');
 	}
-	
+
+	if (!result.result) {
+		throw new Error('Missing MCP result payload');
+	}
+
 	return result.result;
 }
 
@@ -103,7 +103,7 @@ function parseStatsFromText(text: string): {
 			section = 'topics';
 		} else if (line === 'People mentioned:') {
 			section = 'people';
-		} else if (line.trim().startsWith('  ')) {
+		} else if (/^\s{2}\S/.test(line)) {
 			const match = line.trim().match(/^([^:]+):\s*(\d+)/);
 			if (match) {
 				const [, key, value] = match;
@@ -160,20 +160,23 @@ export async function getThoughts(params: {
 
 function parseSearchResults(text: string): Thought[] {
 	const thoughts: Thought[] = [];
-	const blocks = text.split(/--- Result \d+/);
-	
+	const blocks = text.match(/--- Result \d+[\s\S]*?(?=(\n\n--- Result \d+|\n\nSearch strategy:|$))/g) || [];
+
 	for (const block of blocks) {
-		if (!block.trim() || block.includes('No thoughts found')) continue;
-		
 		const lines = block.trim().split('\n');
 		let content = '';
 		let createdAt = '';
 		let type: ThoughtType = 'observation';
 		const topics: string[] = [];
 		const people: string[] = [];
+		const actionItems: string[] = [];
+		let inContent = false;
+		const contentLines: string[] = [];
 		
 		for (const line of lines) {
-			if (line.startsWith('Captured:')) {
+			if (line.startsWith('--- Result ')) {
+				continue;
+			} else if (line.startsWith('Captured:')) {
 				createdAt = line.replace('Captured:', '').trim();
 			} else if (line.startsWith('Type:')) {
 				type = line.replace('Type:', '').trim() as ThoughtType;
@@ -181,16 +184,23 @@ function parseSearchResults(text: string): Thought[] {
 				topics.push(...line.replace('Topics:', '').trim().split(', '));
 			} else if (line.startsWith('People:')) {
 				people.push(...line.replace('People:', '').trim().split(', '));
-			} else if (line.trim() && !line.includes('% match)')) {
-				content += (content ? '\n' : '') + line;
+			} else if (line.startsWith('Actions:')) {
+				actionItems.push(...line.replace('Actions:', '').trim().split('; ').filter(Boolean));
+			} else if (line.trim() === '') {
+				if (!inContent) inContent = true;
+				else contentLines.push('');
+			} else if (inContent) {
+				contentLines.push(line.trimStart());
 			}
 		}
+
+		content = contentLines.join('\n').trim();
 		
 		if (content) {
 			thoughts.push({
 				id: crypto.randomUUID(),
 				content,
-				metadata: { type, topics, people },
+				metadata: { type, topics, people, action_items: actionItems, dates_mentioned: [] },
 				created_at: createdAt ? new Date(createdAt).toISOString() : new Date().toISOString(),
 			});
 		}
@@ -201,26 +211,36 @@ function parseSearchResults(text: string): Thought[] {
 
 function parseListResults(text: string): Thought[] {
 	const thoughts: Thought[] = [];
-	const lines = text.split('\n');
-	
-	for (const line of lines) {
-		// Format: "1. [Mar 15, 2026] (type - topic)\n   content"
-		const match = line.match(/^\d+\.\s*\[([^\]]+)\]\s*\(([^)]+)\)\s*(.+)$/);
-		if (match) {
-			const [, dateStr, metaStr, content] = match;
-			const [type, ...topicParts] = metaStr.split(' - ');
-			
-			thoughts.push({
-				id: crypto.randomUUID(),
-				content: content.trim(),
-				metadata: {
-					type: type.trim() as ThoughtType,
-					topics: topicParts.join(' - ').split(', ').map(t => t.trim()).filter(Boolean),
-					people: [],
-				},
-				created_at: new Date(dateStr).toISOString(),
-			});
-		}
+
+	if (text.includes('No thoughts found.')) {
+		return thoughts;
+	}
+
+	const normalized = text.replace(/^\d+\s+recent thought\(s\):\s*/i, '').trim();
+	const chunks = normalized.split(/\n\n(?=\d+\.\s*\[)/);
+
+	for (const chunk of chunks) {
+		const lines = chunk.split('\n');
+		const header = lines.shift()?.trim() || '';
+		const content = lines.join('\n').trim();
+		const match = header.match(/^\d+\.\s*\[([^\]]+)\]\s*\(([^)]+)\)$/);
+		if (!match || !content) continue;
+
+		const [, dateStr, metaStr] = match;
+		const [type, ...topicParts] = metaStr.split(' - ');
+
+		thoughts.push({
+			id: crypto.randomUUID(),
+			content,
+			metadata: {
+				type: type.trim() as ThoughtType,
+				topics: topicParts.join(' - ').split(', ').map(t => t.trim()).filter(Boolean),
+				people: [],
+				action_items: [],
+				dates_mentioned: [],
+			},
+			created_at: new Date(dateStr).toISOString(),
+		});
 	}
 	
 	return thoughts;
@@ -240,6 +260,8 @@ export async function captureThought(content: string): Promise<Thought> {
 			type: (match?.[1] || 'observation') as ThoughtType,
 			topics: [],
 			people: [],
+			action_items: [],
+			dates_mentioned: [],
 		},
 		created_at: new Date().toISOString(),
 	};
