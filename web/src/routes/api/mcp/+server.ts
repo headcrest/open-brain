@@ -34,8 +34,12 @@ function parseMcpResponse(body: string): McpJsonRpcResponse {
 	throw new Error('Unable to parse MCP response');
 }
 
-export const POST: RequestHandler = async ({ request }) => {
+export const POST: RequestHandler = async ({ request, locals }) => {
 	try {
+		if (!locals.user) {
+			return json({ error: 'Unauthorized' }, { status: 401 });
+		}
+
 		const payload = await request.json();
 		const { name, args } = payload as { name?: string; args?: Record<string, unknown> };
 

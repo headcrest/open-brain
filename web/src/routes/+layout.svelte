@@ -1,7 +1,15 @@
-<script>
+<script lang="ts">
 	import '../app.css';
-	
-	let { children } = $props();
+	import type { Snippet } from 'svelte';
+
+	let {
+		children,
+		data,
+	}: {
+		children: Snippet;
+		data: { user: { email?: string | null } | null };
+	} = $props();
+	const user = $derived(data.user);
 </script>
 
 <div class="min-h-screen flex flex-col">
@@ -11,9 +19,14 @@
 				<span class="text-2xl">🧠</span>
 				<h1 class="text-xl font-bold">Open Brain</h1>
 			</a>
-			<a href="https://github.com/headcrest/open-brain" target="_blank" rel="noopener" class="text-text-muted hover:text-text transition-colors text-sm">
-				GitHub
-			</a>
+			<div class="flex items-center gap-3 text-sm">
+				{#if user}
+					<span class="text-text-muted">{user.email ?? 'Signed in'}</span>
+					<a href="/signout" class="text-text-muted hover:text-text transition-colors">Sign out</a>
+				{:else}
+					<a href="/signin" class="text-text-muted hover:text-text transition-colors">Sign in</a>
+				{/if}
+			</div>
 		</div>
 	</header>
 	
