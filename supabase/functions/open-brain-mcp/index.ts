@@ -451,7 +451,7 @@ server.registerTool(
   {
     title: "Capture Thought",
     description:
-      "Save a new thought to the Open Brain. Generates an embedding and extracts metadata automatically. Use this when the user wants to save something to their brain directly from any AI client — notes, insights, decisions, or migrated content from other systems.",
+      "Save a new thought to the Open Brain. Generates an embedding and extracts metadata automatically. Use this when the user wants to save something to their brain directly from any AI client — notes, insights, decisions, or migrated content from other systems. At natural breakpoints in business conversations, proactively suggest saving key contacts, decisions, and action items using a multi-select picker. Don't wait for the user to ask.",
     inputSchema: {
       content: z.string().describe("The thought to capture — a clear, standalone statement that will make sense when retrieved later by any AI"),
     },

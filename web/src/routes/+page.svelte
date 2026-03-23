@@ -1,7 +1,16 @@
 <script lang="ts">
-	import { getStats, getThoughts, captureThought } from '$lib/api';
+	import {
+		getMcpServers,
+		getStats,
+		getThoughts,
+		captureThought,
+		type McpServerOption,
+	} from '$lib/api';
 	import { THOUGHT_TYPES, type Thought, type ThoughtType } from '$lib/types';
 	import { onMount } from 'svelte';
+
+	const CAPTURE_SERVER_STORAGE_KEY = 'open-brain-capture-server-id';
+	const CAPTURE_TOOL_STORAGE_KEY = 'open-brain-capture-tool';
 
 	let thoughts = $state<Thought[]>([]);
 	let loading = $state(true);
@@ -20,6 +29,10 @@
 	let selectedThought = $state<Thought | null>(null);
 	let latestResultKey = $state<string | null>(null);
 	let searchInput: HTMLInputElement | null = null;
+	let mcpServers = $state<McpServerOption[]>([]);
+	let selectedCaptureServerId = $state('');
+	let selectedCaptureTool = $state('');
+	let serverLoadError = $state('');
 
 	const typeButtonClass: Record<ThoughtType, string> = {
 		observation: 'bg-observation text-white',
@@ -55,9 +68,79 @@
 
 	onMount(async () => {
 		searchInput?.focus();
+		await loadMcpServers();
 		await loadStats();
 		loading = false;
 	});
+
+	function getServerById(serverId: string): McpServerOption | undefined {
+		return mcpServers.find((server) => server.id === serverId);
+	}
+
+	function getAvailableCaptureTools(server: McpServerOption | undefined): string[] {
+		return server?.captureTools?.length
+			? server.captureTools
+			: ['capture_thought'];
+	}
+
+	function persistCapturePreferences() {
+		if (selectedCaptureServerId) {
+			localStorage.setItem(CAPTURE_SERVER_STORAGE_KEY, selectedCaptureServerId);
+		}
+
+		if (selectedCaptureTool) {
+			localStorage.setItem(CAPTURE_TOOL_STORAGE_KEY, selectedCaptureTool);
+		}
+	}
+
+	function applyCaptureToolFallback() {
+		const server = getServerById(selectedCaptureServerId);
+		const tools = getAvailableCaptureTools(server);
+
+		if (tools.includes(selectedCaptureTool)) {
+			return;
+		}
+
+		selectedCaptureTool = server?.captureDefaultTool || tools[0] || 'capture_thought';
+		persistCapturePreferences();
+	}
+
+	async function loadMcpServers() {
+		serverLoadError = '';
+		try {
+			mcpServers = await getMcpServers();
+		} catch (err) {
+			console.error('Failed to load MCP servers:', err);
+			serverLoadError = 'MCP server metadata is unavailable. Capture will use your default MCP config.';
+			mcpServers = [];
+			selectedCaptureServerId = '';
+			selectedCaptureTool = 'capture_thought';
+			return;
+		}
+
+		if (!mcpServers.length) {
+			serverLoadError = 'No MCP servers configured. Capture will use legacy MCP settings if present.';
+			selectedCaptureServerId = '';
+			selectedCaptureTool = 'capture_thought';
+			return;
+		}
+
+		const storedServer = localStorage.getItem(CAPTURE_SERVER_STORAGE_KEY);
+		const foundServer = storedServer ? getServerById(storedServer) : undefined;
+		selectedCaptureServerId = foundServer ? storedServer! : mcpServers[0].id;
+
+		const selectedServer = getServerById(selectedCaptureServerId);
+		const storedTool = localStorage.getItem(CAPTURE_TOOL_STORAGE_KEY);
+		if (storedTool && selectedServer?.captureTools.includes(storedTool)) {
+			selectedCaptureTool = storedTool;
+		} else {
+			selectedCaptureTool = selectedServer?.captureDefaultTool ||
+				selectedServer?.captureTools?.[0] ||
+				'capture_thought';
+		}
+
+		persistCapturePreferences();
+	}
 
 	async function loadThoughts() {
 		const query = searchQuery.trim();
@@ -211,7 +294,10 @@
 		if (!captureContent.trim()) return;
 		capturing = true;
 		try {
-			await captureThought(captureContent);
+			await captureThought(captureContent, {
+				serverId: selectedCaptureServerId || undefined,
+				tool: selectedCaptureTool || undefined,
+			});
 			captureContent = '';
 			showCapture = false;
 			await loadStats();
@@ -220,6 +306,25 @@
 			console.error('Failed to capture:', err);
 		}
 		capturing = false;
+	}
+
+	function handleCaptureServerChange(event: Event) {
+		const value = (event.target as HTMLSelectElement).value;
+		selectedCaptureServerId = value;
+
+		const selectedServer = getServerById(value);
+		selectedCaptureTool =
+			selectedServer?.captureDefaultTool ||
+			selectedServer?.captureTools?.[0] ||
+			'capture_thought';
+
+		persistCapturePreferences();
+	}
+
+	function handleCaptureToolChange(event: Event) {
+		selectedCaptureTool = (event.target as HTMLSelectElement).value;
+		applyCaptureToolFallback();
+		persistCapturePreferences();
 	}
 </script>
 
@@ -246,6 +351,43 @@
 	<!-- Capture Form -->
 	{#if showCapture}
 		<div class="mb-6 bg-bg-card border border-white/10 rounded-xl p-5">
+			<div class="mb-3 grid gap-3 sm:grid-cols-2">
+				<label class="text-sm text-text-muted">
+					Server
+					<select
+						onchange={handleCaptureServerChange}
+						value={selectedCaptureServerId}
+						class="mt-2 w-full bg-bg-elevated border border-white/10 rounded-lg px-3 py-2 text-text"
+						disabled={!mcpServers.length}
+					>
+						{#if mcpServers.length === 0}
+							<option value="">Default MCP</option>
+						{:else}
+							{#each mcpServers as server}
+								<option value={server.id}>{server.name}</option>
+							{/each}
+						{/if}
+					</select>
+				</label>
+				<label class="text-sm text-text-muted">
+					Tool
+					<select
+						onchange={handleCaptureToolChange}
+						value={selectedCaptureTool}
+						class="mt-2 w-full bg-bg-elevated border border-white/10 rounded-lg px-3 py-2 text-text"
+						disabled={!selectedCaptureServerId && !getAvailableCaptureTools(undefined).length}
+					>
+						{#each getAvailableCaptureTools(getServerById(selectedCaptureServerId)) as tool}
+							<option value={tool}>{tool}</option>
+						{/each}
+					</select>
+				</label>
+			</div>
+
+			{#if serverLoadError}
+				<div class="mb-3 text-xs text-accent">{serverLoadError}</div>
+			{/if}
+
 			<textarea
 				bind:value={captureContent}
 				placeholder="What's on your mind?"

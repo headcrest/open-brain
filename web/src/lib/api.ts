@@ -21,25 +21,46 @@ interface ApiThought {
 	created_at: string;
 }
 
-async function callMcpTool(name: string, args: Record<string, unknown> = {}): Promise<McpToolResult> {
+export interface McpServerOption {
+	id: string;
+	name: string;
+	captureTools: string[];
+	captureDefaultTool: string;
+	status?: 'ok' | 'error';
+	latencyMs?: number;
+	message?: string;
+}
+
+type McpToolCallOptions = {
+	serverId?: string;
+	serverIds?: string[];
+};
+
+async function callMcpTool(
+	name: string,
+	args: Record<string, unknown> = {},
+	options: McpToolCallOptions = {},
+): Promise<McpToolResult> {
 	const response = await fetch('/api/mcp', {
 		method: 'POST',
 		headers: {
-			'Content-Type': 'application/json'
+			'Content-Type': 'application/json',
 		},
 		body: JSON.stringify({
-			name,
-			args
-		})
+			tool: name,
+			args,
+			serverId: options.serverId,
+			serverIds: options.serverIds,
+		}),
 	});
-	
+
 	if (!response.ok) {
 		const body = (await response.json().catch(() => ({}))) as { error?: string };
 		throw new Error(body.error || `HTTP ${response.status}`);
 	}
 
 	const result = (await response.json()) as McpJsonRpcResponse;
-	
+
 	if (result.error) {
 		throw new Error(result.error.message || 'MCP error');
 	}
@@ -51,31 +72,63 @@ async function callMcpTool(name: string, args: Record<string, unknown> = {}): Pr
 	return result.result;
 }
 
+export async function getMcpServers(includeHealth = false): Promise<McpServerOption[]> {
+	const response = await fetch(includeHealth ? '/api/mcp?health=1' : '/api/mcp');
+
+	if (!response.ok) {
+		const body = (await response.json().catch(() => ({}))) as { error?: string };
+		throw new Error(body.error || `HTTP ${response.status}`);
+	}
+
+	const result = (await response.json()) as {
+		servers?: Array<
+			Partial<McpServerOption> & {
+				id: string;
+				name: string;
+				captureTools?: string[];
+				captureDefaultTool?: string;
+			}
+		>;
+	};
+
+	if (!result.servers) return [];
+
+	return result.servers.map((server) => ({
+		id: server.id,
+		name: server.name,
+		captureTools: server.captureTools || ['capture_thought'],
+		captureDefaultTool: server.captureDefaultTool || 'capture_thought',
+		status: server.status,
+		latencyMs: server.latencyMs,
+		message: server.message,
+	}));
+}
+
 function parseThoughtsFromText(text: string): ApiThought[] {
 	// Parse the formatted text response from list_thoughts
 	const thoughts: ApiThought[] = [];
 	const lines = text.split('\n');
-	
+
 	for (const line of lines) {
 		// Format: "1. [Mar 15, 2026] (observation - topic1, topic2)\n   Content here"
 		const match = line.match(/^(\d+)\.\s*\[([^\]]+)\]\s*\(([^)]+)\)\s*\n?\s*(.+)$/);
 		if (match) {
 			const [, , dateStr, metaStr, content] = match;
 			const [type, topicsStr] = metaStr.split(' - ');
-			
+
 			thoughts.push({
 				id: crypto.randomUUID(),
 				content: content.trim(),
 				metadata: {
 					type: type.trim() as ThoughtType,
-					topics: topicsStr ? topicsStr.split(', ').map(t => t.trim()) : [],
+					topics: topicsStr ? topicsStr.split(', ').map((topic) => topic.trim()) : [],
 					people: [],
 				},
 				created_at: new Date(dateStr).toISOString(),
 			});
 		}
 	}
-	
+
 	return thoughts;
 }
 
@@ -92,7 +145,7 @@ function parseStatsFromText(text: string): {
 		topics: {} as Record<string, number>,
 		people: {} as Record<string, number>,
 	};
-	
+
 	let section = '';
 	for (const line of lines) {
 		if (line.startsWith('Total thoughts:')) {
@@ -113,7 +166,7 @@ function parseStatsFromText(text: string): {
 			}
 		}
 	}
-	
+
 	return stats;
 }
 
@@ -134,26 +187,37 @@ export async function getThoughts(params: {
 	topic?: string | null;
 	person?: string | null;
 	search?: string;
+	serverId?: string;
+	serverIds?: string[];
 }): Promise<Thought[]> {
-	// If searching, use search_thoughts, otherwise use list_thoughts
 	if (params.search) {
-		const result = await callMcpTool('search_thoughts', {
-			query: params.search,
-			limit: params.limit || 50,
-		});
-		// Parse search results - different format
+		const result = await callMcpTool(
+			'search_thoughts',
+			{
+				query: params.search,
+				limit: params.limit || 50,
+			},
+			{
+				serverId: params.serverId,
+				serverIds: params.serverIds,
+			},
+		);
+
 		const text = result.content[0]?.text || '';
 		return parseSearchResults(text);
 	}
-	
+
 	const args: Record<string, unknown> = {
 		limit: params.limit || 50,
 	};
 	if (params.type) args.type = params.type;
 	if (params.topic) args.topic = params.topic;
 	if (params.person) args.person = params.person;
-	
-	const result = await callMcpTool('list_thoughts', args);
+
+	const result = await callMcpTool('list_thoughts', args, {
+		serverId: params.serverId,
+		serverIds: params.serverIds,
+	});
 	const text = result.content[0]?.text || '';
 	return parseListResults(text);
 }
@@ -172,7 +236,7 @@ function parseSearchResults(text: string): Thought[] {
 		const actionItems: string[] = [];
 		let inContent = false;
 		const contentLines: string[] = [];
-		
+
 		for (const line of lines) {
 			if (line.startsWith('--- Result ')) {
 				continue;
@@ -195,7 +259,7 @@ function parseSearchResults(text: string): Thought[] {
 		}
 
 		content = contentLines.join('\n').trim();
-		
+
 		if (content) {
 			thoughts.push({
 				id: crypto.randomUUID(),
@@ -205,7 +269,7 @@ function parseSearchResults(text: string): Thought[] {
 			});
 		}
 	}
-	
+
 	return thoughts;
 }
 
@@ -234,7 +298,7 @@ function parseListResults(text: string): Thought[] {
 			content,
 			metadata: {
 				type: type.trim() as ThoughtType,
-				topics: topicParts.join(' - ').split(', ').map(t => t.trim()).filter(Boolean),
+				topics: topicParts.join(' - ').split(', ').map((topic) => topic.trim()).filter(Boolean),
 				people: [],
 				action_items: [],
 				dates_mentioned: [],
@@ -242,17 +306,26 @@ function parseListResults(text: string): Thought[] {
 			created_at: new Date(dateStr).toISOString(),
 		});
 	}
-	
+
 	return thoughts;
 }
 
-export async function captureThought(content: string): Promise<Thought> {
-	const result = await callMcpTool('capture_thought', { content });
+type CaptureThoughtOptions = {
+	serverId?: string;
+	tool?: string;
+};
+
+export async function captureThought(
+	content: string,
+	options: CaptureThoughtOptions = {},
+): Promise<Thought> {
+	const tool = options.tool || 'capture_thought';
+	const result = await callMcpTool(tool, { content }, { serverId: options.serverId });
 	const text = result.content[0]?.text || '';
-	
+
 	// Response: "Captured as observation — topic1, topic2"
 	const match = text.match(/Captured as (\w+)/);
-	
+
 	return {
 		id: crypto.randomUUID(),
 		content,
